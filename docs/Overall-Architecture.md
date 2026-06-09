@@ -34,8 +34,8 @@ flowchart TD
   MedTeam(["👤 Medical Team"])
 
   subgraph Platform ["IAnamnesis Platform"]
-    Totem["Patient Totem<br/>[Electron + React + TypeScript]<br/>Touch kiosk for anamnesis entry"]
-    Dashboard["Dentist Dashboard<br/>[React + TypeScript / Web]<br/>Real-time alerts and suggestions"]
+    Totem["Patient Totem<br/>[Flutter — Android]<br/>Touch kiosk for anamnesis entry<br/>(Gertec SK210 or Elgin MK21)"]
+    Dashboard["Dentist Dashboard<br/>[React + TypeScript / Web]<br/>Real-time alerts — runs in the dentist's browser"]
     Backoffice["Admin / Backoffice<br/>[React + TypeScript / Web]<br/>Knowledge base authoring"]
 
     API["API Layer<br/>[ASP.NET Core 8]<br/>REST + SignalR WebSocket"]
@@ -255,22 +255,31 @@ This is the continuous improvement loop without ML. Over time, the unresolved in
 | Auth | ASP.NET Core Identity + JWT (clinic-scoped tokens) |
 | Testing | xUnit + Testcontainers (PostgreSQL in-container integration tests) |
 
-### Frontend — Desktop (Totem)
+### Frontend — Android (Totem)
+
+The patient-facing totem runs on Android hardware. Target devices (one will be selected for pilot):
+
+| Hardware | Notes |
+|----------|-------|
+| **Gertec SK210** | Android-based self-service kiosk |
+| **Elgin MK21** | Android-based self-service terminal |
 
 | Concern | Technology |
 |---------|-----------|
-| App Shell | Electron + TypeScript (cross-platform — Windows, macOS, Linux) |
-| UI | React + TypeScript (rendered in Electron's BrowserWindow) |
-| Real-time client | `@microsoft/signalr` npm package (works in both browser and Node.js) |
-| State management | React Context + hooks (or Zustand for heavier state) |
-| Kiosk mode | Electron `kiosk: true` + fullscreen BrowserWindow; touch-optimized React UI |
+| Framework | Flutter (Dart) — single codebase targeting Android |
+| UI | Flutter widget tree; touch-optimized for kiosk use |
+| HTTP client | `dio` or `http` package — sends `POST /anamnesis` and polls status |
+| Kiosk lockdown | Android kiosk mode (dedicated device / lock task); Flutter `SystemChrome` for full-screen |
+| State management | Riverpod or Bloc |
 
 ### Frontend — Web (Dentist Dashboard + Backoffice)
+
+Both the dentist dashboard and the admin backoffice run in the browser on the **doctor's own hardware** (workstation or laptop). No installation required on the clinic side.
 
 | Concern | Technology |
 |---------|-----------|
 | UI Framework | React + TypeScript (Vite build) |
-| Real-time client | `@microsoft/signalr` npm package |
+| Real-time client | `@microsoft/signalr` (npm) — SSE connection for live alert push |
 | State management | React Context + hooks (or Zustand) |
 | Routing | React Router |
 | Dashboard | Live queue list, patient result panel, unresolved input zone |
@@ -313,6 +322,6 @@ This is the continuous improvement loop without ML. Over time, the unresolved in
 | Rule engine vs. ML | Deterministic rule engine | Medical knowledge in dentistry is bounded and auditable. Rules are defensible in clinical and legal contexts; probabilistic inference is not. |
 | Generated text vs. retrieved suggestions | Pre-authored retrieval | Suggestions authored by medical team, referenced to papers. No hallucination risk. Legally cleaner. |
 | WebSocket / SSE vs. Webhook | SignalR (WebSocket + SSE fallback) | Dashboard is a persistent live view, not a one-off notification consumer. Push is more appropriate than polling. |
-| Totem: Desktop vs. Web | Electron + React | Clinic environment: offline resilience, no browser dependency, easy kiosk lockdown (`kiosk: true`). TypeScript frontend shared with the web dashboard reduces context switching. |
-| Dashboard + Backoffice: Desktop vs. Web | React (web) | Dentist and admin UIs are stationary workstations — a browser tab is simpler to deploy and update. Shared React/TypeScript stack with the totem. |
+| Totem: Native Android vs. Web | Flutter (Android) | Clinic kiosk environment: Android hardware (Gertec SK210 / Elgin MK21) runs Flutter natively. Offline resilience, full kiosk lockdown via Android dedicated-device mode. Flutter gives full control over touch UX without a browser layer. |
+| Dashboard + Backoffice: Desktop vs. Web | React (web) | Dentist and admin UIs run in a browser on the doctor's own hardware — a web app is simpler to deploy and update with no installation on the clinic workstation. |
 | Single-server pilot | Docker Compose | Minimizes operational complexity while validating the concept. Architecture supports horizontal scaling later without structural changes. |

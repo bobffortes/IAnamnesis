@@ -12,7 +12,7 @@ The entire backend is C# / .NET 8. No generative AI is involved in the core prod
 
 The totem POST body is the system's only external input boundary. Everything that follows is deterministic computation over this payload.
 
-### Input Structure (schema_version: 2.1)
+### Input Structure (schema_version: 2.2)
 
 The payload is divided into nine clinical sections plus metadata:
 
@@ -58,13 +58,54 @@ Supported reason categories (Brazilian clinical standard):
 | `clareamento` | Clareamento |
 | `avaliacao_exame` | Avaliação / Exame |
 
+### `patient_context` — Vitals Detail (schema_version 2.2)
+
+Most patients know whether they *have* a condition, but not their specific measured values. The vitals section therefore uses a **three-state input model** for blood pressure and blood glucose, capturing what the patient actually knows rather than leaving fields blank.
+
+**Blood pressure:**
+
+```
+blood_pressure:
+  input_mode           → required enum: "measured" | "condition_known" | "unknown"
+  systolic_bp          → integer 60–300  (required if input_mode = "measured")
+  diastolic_bp         → integer 60–300  (required if input_mode = "measured")
+  has_hypertension     → boolean         (required if input_mode = "condition_known")
+```
+
+**Blood glucose:**
+
+```
+blood_glucose:
+  input_mode           → required enum: "measured" | "condition_known" | "unknown"
+  fasting_value        → integer 20–600  (required if input_mode = "measured")
+  has_diabetes         → boolean         (required if input_mode = "condition_known")
+```
+
+**Other vitals (unchanged):**
+
+```
+heart_rate             → optional integer
+is_pregnant            → optional boolean
+is_smoker              → optional boolean
+```
+
+**Totem UX — blood pressure screen:**
+- "Did you check your blood pressure recently?"
+  - "Yes — I know my numbers" → numeric inputs (systolic / diastolic)
+  - "I know whether I have hypertension, but not the numbers" → Yes / No toggle
+  - "I've never checked / I don't know" → no further input needed
+
+The blood glucose screen follows the same three-choice pattern for diabetes.
+
+`input_mode = "unknown"` is clinically distinct from simply omitting the field — it explicitly signals that the patient has *never had these values checked*, which triggers different exam recommendation rules (see Stage 2 and Flag Taxonomy below).
+
 ---
 
 ## Processing Pipeline — All Five Stages
 
 ```mermaid
 flowchart TD
-  Input["Totem POST /anamnesis<br/>JSON payload v2.1"]
+  Input["Totem POST /anamnesis<br/>JSON payload v2.2"]
   S1["Stage 1 - Entity Resolution<br/>Map IDs and free-text to canonical entities<br/>Unknown inputs -> unresolved queue"]
   S2["Stage 2 - Context Assembly<br/>Expand entities to flags<br/>Apply vital sign thresholds<br/>Apply demographic modifiers"]
   S3["Stage 3 - Rule Matching<br/>Evaluate correlation_rules against active flag set<br/>Filter by appointment_reason + demographics + vitals"]
@@ -113,14 +154,47 @@ Stage 1 also resolves cross-section relationships:
 
 This stage expands every resolved entity into its associated flags via the `condition_flags` table, `drugs.allergy_groups`, and `allergies.cross_reaction_groups`, then applies vital sign and demographic rules directly.
 
-**Vital sign thresholds (hardcoded — not authored rules):**
+**Vital sign flags (hardcoded — not authored rules):**
+
+Blood pressure and blood glucose produce flags via one of three paths determined by `input_mode`.
+
+**Numeric path (`input_mode = "measured"`):**
 
 | Condition | Flag |
 |-----------|------|
 | `systolic_bp >= 180` OR `diastolic_bp >= 110` | `hypertensive_crisis` |
 | `systolic_bp >= 140` OR `diastolic_bp >= 90` | `hypertension_stage2` |
-| `blood_glucose_fasting >= 200` | `diabetes_uncontrolled` |
-| `blood_glucose_fasting >= 126` | `diabetes_elevated` |
+| `fasting_value >= 200` | `diabetes_uncontrolled` |
+| `fasting_value >= 126` | `diabetes_elevated` |
+
+These thresholds follow ANVISA / SBC / SBD clinical guidelines and carry full severity grading.
+
+**Self-reported path (`input_mode = "condition_known"`):**
+
+| Condition | Flag |
+|-----------|------|
+| `has_hypertension == true` | `hypertension_self_reported` |
+| `has_hypertension == false` | *(no flag)* |
+| `has_diabetes == true` | `diabetes_self_reported` |
+| `has_diabetes == false` | *(no flag)* |
+
+Self-reported flags carry no numeric severity grade. They trigger conservative precautions and generate "measure before procedure" exam suggestions on invasive appointments.
+
+**Unknown path (`input_mode = "unknown"`):**
+
+| Condition | Flag |
+|-----------|------|
+| blood pressure | `blood_pressure_unknown` |
+| blood glucose | `blood_glucose_unknown` |
+
+Unknown flags signal that no BP or glucose data is available and the condition has never been checked. Rules targeting these flags recommend ordering the relevant exam before any invasive procedure — this is the most safety-critical state for surgical planning.
+
+**These paths are additive to `conditions[]`.** If a patient also lists `cond_hypertension` in the conditions section, those entity-derived flags (`vasoconstrictor_caution`, `antihypertensive_active`) still apply independently. The vitals three-state path adds *measurement-context* flags on top.
+
+**Demographic and other thresholds (unchanged):**
+
+| Condition | Flag |
+|-----------|------|
 | `age >= 65` | `elderly` |
 | `age <= 12` | `pediatric` |
 | `is_pregnant == true` | `pregnancy` |
@@ -162,8 +236,8 @@ FIRES if:
   AND (sex_filter == 'any' OR patient.sex == sex_filter)
   AND (pregnancy_relevant == false OR patient.is_pregnant == true)
   AND (requires_surgery_recency == false OR surgery_elapsed_years <= surgery_recency_years)
-  AND (systolic_bp_threshold is null OR patient.systolic_bp >= systolic_bp_threshold)
-  AND (blood_glucose_threshold is null OR patient.blood_glucose_fasting >= blood_glucose_threshold)
+  AND (systolic_bp_threshold is null OR (blood_pressure.input_mode = "measured" AND patient.blood_pressure.systolic_bp >= systolic_bp_threshold))
+  AND (blood_glucose_threshold is null OR (blood_glucose.input_mode = "measured" AND patient.blood_glucose.fasting_value >= blood_glucose_threshold))
 ```
 
 All conditions are evaluated in memory over the flat flag set. No join queries at rule evaluation time.
@@ -210,7 +284,7 @@ sequenceDiagram
   participant Dashboard as Dentist Dashboard
 
   Patient->>Totem: Fills anamnesis form (touch)
-  Totem->>API: POST /anamnesis (JSON v2.1)
+  Totem->>API: POST /anamnesis (JSON v2.2)
   API-->>Totem: 202 Accepted + session_id
   API->>Queue: Enqueue(session_id, payload)
 
@@ -223,7 +297,7 @@ sequenceDiagram
   Engine->>DB: Stage 4 - Load suggestions + exam_suggestions by rule IDs
   Engine->>DB: Stage 5 - Write session_results + session_fired_rules
 
-  API->>Dashboard: Push result via SignalR WebSocket
+  API->>Dashboard: Push result via SSE (session.result.ready)
   Dashboard-->>Dashboard: Render alerts, exam orders, unresolved inputs
 ```
 
@@ -275,9 +349,20 @@ Flags are the shared vocabulary between Stage 2 (entity expansion) and Stage 3 (
 |------|---------|---------------|
 | `cardiac_history` | Cardiac surgery in past 5 years, MI, severe arrhythmia | Cardiologist clearance before invasive procedures |
 | `pacemaker_present` | pacemaker == true | Avoid ultrasonic scalers; EMI precaution |
-| `hypertension_stage2` | SBP >= 140 or DBP >= 90 | Monitor BP; limit vasoconstrictor |
-| `hypertensive_crisis` | SBP >= 180 or DBP >= 110 | Defer all elective procedures |
+| `hypertension_stage2` | SBP >= 140 or DBP >= 90 (measured) | Monitor BP; limit vasoconstrictor |
+| `hypertensive_crisis` | SBP >= 180 or DBP >= 110 (measured) | Defer all elective procedures |
+| `hypertension_self_reported` | `has_hypertension == true` (no numeric data) | Vasoconstrictor limit; BP measurement required before invasive procedures |
+| `blood_pressure_unknown` | `blood_pressure.input_mode == "unknown"` | BP never checked; measure before any invasive procedure; exam order triggered |
 | `endocarditis_risk` | Prosthetic valve, prior endocarditis, congenital heart disease | Antibiotic prophylaxis (AHA protocol) |
+
+### Endocrine / Metabolic Flags
+
+| Flag | Trigger | Dental Impact |
+|------|---------|---------------|
+| `diabetes_elevated` | Fasting glucose >= 126 mg/dL (measured) | Healing and infection precautions; exam recommended |
+| `diabetes_uncontrolled` | Fasting glucose >= 200 mg/dL (measured) | Defer elective invasive procedures; HbA1c required |
+| `diabetes_self_reported` | `has_diabetes == true` (no numeric data) | Healing and infection precautions; fasting glucose exam required before invasive procedures |
+| `blood_glucose_unknown` | `blood_glucose.input_mode == "unknown"` | Glucose never checked; fasting glucose exam required before invasive procedures; dentist alert |
 
 ### Allergy / Drug Flags
 
@@ -330,8 +415,8 @@ flowchart LR
     A9["POST /unresolved/:id/resolve<br/>Map unresolved to entity"]
   end
 
-  subgraph SignalR ["SignalR Hub"]
-    H1["Hub: /hubs/clinic<br/>Join clinic group on connect<br/>Event: session.result.ready"]
+  subgraph SSE ["SSE Hub (server → client only)"]
+    H1["Hub: /hubs/clinic<br/>Doctor joins clinic:{clinicId}:doctor:{doctorId}<br/>Also joins clinic:{clinicId} for clinic-wide events<br/>Event: session.result.ready (SSE push)<br/>Totem sends via HTTP POST only — no SSE subscription"]
   end
 ```
 
@@ -353,8 +438,13 @@ Validation (FluentValidation):
 - `schema_version` must match server-supported versions
 - `appointment.reason_category` must be a known code
 - `patient_context.age` must be in range 1–120
-- `patient_context.systolic_bp` if present must be 60–300
-- `patient_context.blood_glucose_fasting` if present must be 20–600
+- `blood_pressure.input_mode` required; must be `"measured"` | `"condition_known"` | `"unknown"`
+- `blood_pressure.systolic_bp` required if `input_mode = "measured"`; range 60–300
+- `blood_pressure.diastolic_bp` required if `input_mode = "measured"`; range 60–300
+- `blood_pressure.has_hypertension` required if `input_mode = "condition_known"`
+- `blood_glucose.input_mode` required; must be `"measured"` | `"condition_known"` | `"unknown"`
+- `blood_glucose.fasting_value` required if `input_mode = "measured"`; range 20–600
+- `blood_glucose.has_diabetes` required if `input_mode = "condition_known"`
 
 Validation errors return `400 Bad Request` with a structured error body. The totem displays a retry prompt.
 
@@ -382,9 +472,16 @@ Returns the current queue state for the connected clinic, ordered by `queue_posi
 
 `alert_badge` is populated after processing completes (`CRITICAL`, `WARNING`, `INFO`, `OK`, `UNRESOLVED_ONLY`). The dashboard uses this to color-code the queue list.
 
-### SignalR Hub: /hubs/clinic
+### SSE Hub: /hubs/clinic
 
-On connection, the client authenticates with a JWT and joins its clinic's group. The server emits `session.result.ready` with the full result object when Stage 5 completes. The dashboard renders alerts immediately without a polling GET.
+SSE is server-to-client only. The dentist dashboard opens an SSE connection and joins two groups using hierarchical composite keys:
+
+- `clinic:{clinicId}` — clinic-wide scope (admin broadcasts, queue state)
+- `clinic:{clinicId}:doctor:{doctorId}` — doctor-scoped scope (receives `session.result.ready`)
+
+The server emits `session.result.ready` with the full result object to the doctor's group when Stage 5 completes. The dashboard renders alerts immediately without a polling GET.
+
+The totem never connects to this hub — it sends via `POST /anamnesis` only and optionally polls `GET /anamnesis/{session_id}/status`. The `clinicId` is always injected server-side from the authenticated identity; it is never trusted from the client payload.
 
 ---
 
@@ -698,8 +795,12 @@ These are the highest-priority rules for the pilot knowledge base. Each is a dir
 | `RULE_A003` | `antidepressant_active` | any | Suggestion: avoid tramadol (serotonin syndrome) | WARNING |
 | `RULE_V001` | `vasoconstrictor_caution` | any | Suggestion: limit epinephrine 1:200,000 max 2 carpules | WARNING |
 | `RULE_V002` | `hypertensive_crisis` | any | Alert: defer all elective procedures | CRITICAL |
+| `RULE_V003` | `hypertension_self_reported` | extracao, implante, cirurgia_eletiva, periodontia | Exam: Medição de PA antes do procedimento | WARNING |
+| `RULE_V004` | `blood_pressure_unknown` | any | Alert: PA não verificada — medir antes de qualquer procedimento invasivo | WARNING |
 | `RULE_C001` | `endocarditis_risk` | extracao, periodontia, implante, tratamento_canal | Suggestion: AHA antibiotic prophylaxis protocol | CRITICAL |
 | `RULE_B001` | `bronj_high_risk` + `bisphosphonate_use` | extracao | Suggestion: MRONJ protocol, surgeon consult | CRITICAL |
+| `RULE_D001` | `diabetes_self_reported` | extracao, implante, cirurgia_eletiva, tratamento_canal | Exam: Glicemia em Jejum antes do procedimento | WARNING |
+| `RULE_D002` | `blood_glucose_unknown` | extracao, implante, cirurgia_eletiva, tratamento_canal | Exam: Glicemia em Jejum + Alerta para dentista revisar | WARNING |
 
 ---
 
@@ -760,7 +861,7 @@ The review queue is the organic knowledge base growth mechanism. Every unresolve
 | Background Worker | .NET Worker Service | Single `BackgroundService`, `Channel<T>` queue |
 | ORM | EF Core 8 | Code-first; PostgreSQL provider; `ToJson()` for JSONB columns |
 | Database | PostgreSQL 16 | JSONB for session blobs; `VARCHAR[]` for flag arrays |
-| Real-time | ASP.NET Core SignalR | WebSocket + SSE fallback; clinic-scoped groups |
+| Real-time | ASP.NET Core SignalR (SSE transport) | SSE server-to-client only; hierarchical group keys (`clinic:{id}`, `clinic:{id}:doctor:{id}`); HTTP POST for totem-to-server direction |
 | Input Matching | FuzzySharp | Token-sort ratio; extensible to Lucene.NET for larger corpus |
 | Validation | FluentValidation | Endpoint-level validators; custom rule for known reason codes |
 | Auth | ASP.NET Core Identity + JWT | Clinic-scoped tokens; `clinic_id` claim on every request |
@@ -769,21 +870,26 @@ The review queue is the organic knowledge base growth mechanism. Every unresolve
 | Logging | Serilog → stdout | Structured JSON logs; Docker log driver handles aggregation |
 | Health Checks | ASP.NET Core Health Checks | `/health/live`, `/health/ready`; PostgreSQL connectivity check |
 
-### Frontend — Desktop (Totem)
+### Frontend — Android (Totem)
+
+The totem runs Flutter on Android hardware. Target devices: **Gertec SK210** or **Elgin MK21** (one selected for pilot).
 
 | Layer | Technology | Notes |
 |-------|-----------|-------|
-| App Shell | Electron + TypeScript | Cross-platform desktop (Windows / macOS / Linux); `kiosk: true` for fullscreen lockdown |
-| UI | React + TypeScript | Touch-optimized; rendered in Electron's BrowserWindow |
-| SignalR Client | `@microsoft/signalr` (npm) | Works in Node.js and browser context; reconnect with exponential backoff |
+| Framework | Flutter (Dart) | Native Android; single codebase; touch-optimized kiosk UI |
+| HTTP client | `dio` / `http` | `POST /anamnesis` to submit form; polls `GET /anamnesis/{session_id}/status` for result readiness |
+| Kiosk lockdown | Android dedicated-device mode | Flutter `SystemChrome.setEnabledSystemUIMode` for full-screen; no browser layer |
+| Real-time | None (no SSE on totem) | Totem only sends — SSE subscription is the dentist dashboard's concern |
 | Auth | No JWT | Clinic-trusted network; totem identified by `totem_id` in payload |
 
 ### Frontend — Web (Dentist Dashboard + Backoffice)
 
+Both views run in the **browser on the doctor's own hardware** (workstation or laptop at the clinic). No installation required on the doctor's machine.
+
 | Layer | Technology | Notes |
 |-------|-----------|-------|
 | UI Framework | React + TypeScript (Vite) | Dentist dashboard and admin backoffice as separate React apps (or routes) |
-| SignalR Client | `@microsoft/signalr` (npm) | Dashboard subscribes to `session.result.ready` on connect; clinic-scoped group |
+| SSE Client | `@microsoft/signalr` (npm) | Dashboard subscribes to `session.result.ready` via SSE on connect; joins `clinic:{clinicId}` and `clinic:{clinicId}:doctor:{doctorId}` groups |
 | State management | React Context + hooks | Queue list, active result, unresolved panel; Zustand if complexity grows |
 | Auth | JWT (Bearer) | `clinic_id` claim; backoffice requires admin role |
 
@@ -792,7 +898,7 @@ The review queue is the organic knowledge base growth mechanism. Every unresolve
 | Concern | Technology | Notes |
 |---------|-----------|-------|
 | Containerization | Docker + Docker Compose | Single-server; all services in one `docker-compose.yml` |
-| Reverse Proxy | Nginx | TLS termination; WebSocket proxy for SignalR |
+| Reverse Proxy | Nginx | TLS termination; SSE proxy for real-time push events |
 | Database | PostgreSQL 16 in Docker | Volume-mounted data dir; daily `pg_dump` backup |
 | CI | GitHub Actions | Build + test on PR; Docker image push on main |
 
